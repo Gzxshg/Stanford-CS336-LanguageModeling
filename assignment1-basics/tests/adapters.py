@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
-import re
+import regex as re
+import heapq
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy.typing as npt
 import torch
@@ -591,53 +592,11 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    from cs336_basics.train_bpe import train_bpe
 
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-    if special_tokens is not None:
-        pattern="|".join(re.escape(t) for t in special_tokens)
-        chunks=re.split(pattern, text)
-    else:
-        chunks= [text]
-    
-    pre_tokenized=[]
-    for chunk in chunks:
-        tokens=re.findall(PAT, chunk)
-        pre_tokenized.extend([t.encode("utf-8") for t in tokens])
-    vocab: dict[int, bytes] = {i: token for i, token in enumerate(set(pre_tokenized))}
-    next_id=256
-    merges:list[tuple[bytes, bytes]]=[]
-
-    while next_id<vocab_size:
-        pair_counts: Counter = Counter()
-        for tokens in pre_tokenized:
-            for i in range(len(tokens)-1):
-                pair=(tokens[i], tokens[i+1])
-                pair_counts[pair]+=1
-        
-        if not pair_counts:
-            break
-        
-        max_count=max(pair_counts.values())
-        candidates=[pair for pair, count in pair_counts.items() if count==max_count]
-        top_pair=max(candidates)
-        new_token=top_pair[0]+top_pair[1]
-        for tokens in pre_tokenized:
-            merged=[]
-            i=0
-            while i < len(tokens):
-                if (i<len(tokens)-1 and
-                    tokens[i]==top_pair[0] and
-                    tokens[i+1]==top_pair[1]):
-                    merged.append(new_token)
-                    i+=2
-                else:
-                    merged.append(tokens[i])
-                    i+=1
-            tokens[:]=merged
-            vocab[next_id]=new_token
-            merges.append(top_pair)
-            next_id+=1
-    return vocab, merges
+    return train_bpe(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        **kwargs,
+    )
