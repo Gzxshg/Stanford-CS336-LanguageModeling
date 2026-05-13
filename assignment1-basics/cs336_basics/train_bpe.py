@@ -156,7 +156,6 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     merges: list[tuple[bytes, bytes]] = []
     num_merges = vocab_size - len(vocab)
     
-    # 第一版：无法通过 test_train_bpe_speed
     for _ in range(num_merges):
         if not pair_counts:
             break

@@ -37,7 +37,8 @@ def build_word_counts_for_chunks(
     with open(input_path, 'r', encoding='utf-8') as f:
         f.seek(start)
         chunk_bytes=f.read(end-start)
-    chunk_text=chunk_bytes.encode('utf-8')
+    chunk_text=chunk_bytes
+    
 
     if special_tokens:
         escaped_tokens=[re.escape(tok) for tok in special_tokens]
@@ -134,7 +135,7 @@ def find_longest_token(vocab: dict[int, bytes]):
     return best_id, vocab[best_id]
 def main():
     input_path = "/root/autodl-tmp/Stanford-CS336-LanguageModeling/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt"
-    vocab_size = 10_000
+    vocab_size = 10000
     special_tokens = ["<|endoftext|>"]
     num_processes = 8   
     
