@@ -12,6 +12,8 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from cs336_basics import multihead_self_attention
+
 
 def run_linear(
     d_in: int,
@@ -164,7 +166,16 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.multihead_self_attention import MultiheadSelfAttention
+    return MultiheadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        q_proj_weight=q_proj_weight,
+        k_proj_weight=k_proj_weight,
+        v_proj_weight=v_proj_weight,
+        o_proj_weight=o_proj_weight,
+        in_features=in_features,
+    )
 
 
 def run_multihead_self_attention_with_rope(
