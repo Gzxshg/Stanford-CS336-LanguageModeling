@@ -44,6 +44,7 @@ def run_linear(
     linear.load_state_dict({"weight": weights})
     return linear(in_features)
 
+
 def run_embedding(
     vocab_size: int,
     d_model: int,
@@ -70,8 +71,9 @@ def run_embedding(
         embedding_dim=d_model,
         device=weights.device
     )
-    embedding.load_state_dict({"embeddings": weights})
+    embedding.load_state_dict({"weight": weights})
     return embedding(token_ids)
+
 
 def run_swiglu(
     d_model: int,
@@ -238,6 +240,7 @@ def run_multihead_self_attention_with_rope(
     })
     return mha(in_features,token_positions=token_positions)
 
+
 def run_rope(
     d_k: int,
     theta: float,
@@ -341,7 +344,12 @@ def run_transformer_block(
     transformer_block=TransformerBlock(
         d_model=d_model,
         d_ff=d_ff,
-        num_heads=num_heads)
+        num_heads=num_heads,
+        theta=theta,
+        max_seq_len=max_seq_len
+        )
+    transformer_block.load_state_dict(weights)
+    return transformer_block(in_features)
     
 
 
@@ -424,7 +432,18 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer_lm import TransformerLM
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+    model.load_state_dict(weights)
+    return model(in_indices)
 
 
 def run_rmsnorm(

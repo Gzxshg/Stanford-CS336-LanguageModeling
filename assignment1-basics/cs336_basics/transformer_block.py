@@ -15,7 +15,9 @@ class TransformerBlock(nn.Module):
             self, 
             d_model: int, 
             num_heads: int, 
-            d_ff: int
+            d_ff: int,
+            theta: float,
+            max_seq_len: int = None,
             ):
         super().__init__()
         
@@ -23,14 +25,24 @@ class TransformerBlock(nn.Module):
         assert d_model % num_heads == 0, "d_model 必须能被 num_heads 整除"
 
         # 第一部分：多头自注意力子层 (MHA)
-        self.norm1 = RMSNorm(d_model)
+        self.ln1 = RMSNorm(d_model)
         # 替换为你自己实现的 MultiHeadSelfAttention
-        self.attn = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads) 
+        self.attn = MultiHeadSelfAttention(
+            d_model=d_model, 
+            num_heads=num_heads,
+            max_seq_len=max_seq_len, 
+            use_rope=True, 
+            theta=theta) 
 
         # 第二部分：SwiGLU 前馈网络子层 (FFN)
-        self.norm2 = RMSNorm(d_model)
-        # 替换为你自己实现的 SwiGLUFeedForward
-        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff) 
+        self.ln2 = RMSNorm(d_model)
+        self.ffn = SwiGLU(
+            d_model=d_model, 
+            d_ff=d_ff,
+            w1_weight=None,
+            w2_weight=None,
+            w3_weight=None
+            ) 
 
     def forward(self, x):
         """
@@ -39,10 +51,10 @@ class TransformerBlock(nn.Module):
         """
         # 1. 第一个子层：Pre-norm -> Attention -> 残差连接
         # 对应公式: y = x + MultiHeadSelfAttention(RMSNorm(x))
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.ln1(x))
         
         # 2. 第二个子层：Pre-norm -> SwiGLU FFN -> 残差连接
         # 对应公式: z = y + SwiGLUFFN(RMSNorm(y))
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.ffn(self.ln2(x))
         
         return x

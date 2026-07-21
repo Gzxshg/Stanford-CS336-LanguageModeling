@@ -80,7 +80,7 @@ class MultiHeadSelfAttention(nn.Module):
         v = self._split_heads(v)
         
         if self.use_rope:
-            if token_positions is not None:
+            if token_positions is None:
                 base_positions = torch.arange(
                     seq_len,
                     device=x.device,
