@@ -9,5 +9,8 @@
 (c) \xef\xbf\xbf
 
 3.5 Transformer Accounting
-(a) Total Parameter is 1.64B. Transformer Blocks take most of them. At the same time, the requirement of model loading is 3.52TFLOPs at single precision mode.
-(b) 
+(a) Total Parameter is 1.64B. Transformer Blocks take most of them. 
+(b) At the same time, the requirement of model loading is 3.52TFLOPs at single precision mode.
+(c) FFN
+(d) The parameter of Transformer Block grows much faster than other
+(e) Total flops is sixteen times than origin.

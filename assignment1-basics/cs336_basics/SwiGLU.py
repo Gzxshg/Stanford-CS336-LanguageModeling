@@ -4,6 +4,7 @@ from jaxtyping import Float
 from torch import Tensor
 
 from .linear import Linear
+from .silu import SiLU
 
 
 class SwiGLU(nn.Module):
@@ -45,5 +46,7 @@ class SwiGLU(nn.Module):
 
         a = self.w1(in_features)                     # (..., d_ff)
         b = self.w3(in_features)                     # (..., d_ff)
-        silu_a = a * torch.sigmoid(a)                # SiLU via sigmoid
+        silu_a_embodied = SiLU()                        
+        silu_a=silu_a_embodied(a)                   # (..., d_ff)
+                        # SiLU via sigmoid
         return self.w2(silu_a * b)                   # (..., d_model)
