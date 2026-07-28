@@ -11,6 +11,7 @@ cd "$(dirname "$0")"
 
 # ---- run knobs (env-var overridable) ----
 DATA_PREFIX=${DATA_PREFIX:-tinystories}
+VOCAB_SIZE=${VOCAB_SIZE:-10000}
 BATCH_SIZE=${BATCH_SIZE:-128}
 LR=${LR:-3e-3}
 MIN_LR=${MIN_LR:-3e-4}
@@ -32,7 +33,7 @@ echo "data=${DATA_PREFIX} batch=${BATCH_SIZE} lr=${LR} iters=${TOTAL_ITERS} ckpt
 exec uv run train.py \
   --train-data "data/${DATA_PREFIX}_train_tokens.npy" \
   --valid-data "data/${DATA_PREFIX}_valid_tokens.npy" \
-  --vocab-size 10000 \
+  --vocab-size "$VOCAB_SIZE" \
   --context-length "$CONTEXT_LENGTH" \
   --d-model 512 --num-layers 4 --num-heads 16 --d-ff 1344 --rope-theta 10000 \
   --batch-size "$BATCH_SIZE" \

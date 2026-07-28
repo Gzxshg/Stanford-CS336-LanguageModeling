@@ -16,10 +16,14 @@ class Tiny_BPETokenizer:
         vocab: dict[int,bytes], 
         merges: list[tuple[bytes,bytes]], 
         special_tokens: list[str] | None = None,
+        max_pretoken_bytes: int | None = None,
     ):
         self.vocab = vocab
         self.merges = merges
         self.special_tokens = special_tokens or []
+        # 可选: 超长 pretoken 按此字节数切段(应对网页垃圾文本中几万字节的
+        # 连续数字/符号串, 否则逐对合并是 O(L^2) 会卡死; None 表示不截断)
+        self.max_pretoken_bytes = max_pretoken_bytes
         
         self.merge_ranks = {pair: rank for rank,pair in enumerate(self.merges)}
         
@@ -147,15 +151,37 @@ class Tiny_BPETokenizer:
         return [self.token_to_id[tok] for tok in tokens]
         
     
+    def _split_long_pretoken(self, pretoken: str) -> list[str]:
+        """按 max_pretoken_bytes 把超长 pretoken 切成小段(按字符边界, 保证 utf-8 合法)"""
+        pieces = []
+        buf: list[str] = []
+        size = 0
+        for ch in pretoken:
+            b = len(ch.encode("utf-8"))
+            if buf and size + b > self.max_pretoken_bytes:
+                pieces.append("".join(buf))
+                buf = []
+                size = 0
+            buf.append(ch)
+            size += b
+        if buf:
+            pieces.append("".join(buf))
+        return pieces
+
     def _encode_normal_text(self, text: str):
         """编码除special tokens外的文本"""
         pretokens = self._pretokenize(text)
         all_ids = []
-        
+
         for pretoken in pretokens:
-            seq_tokens = self._encode_pretoken_to_tokens(pretoken)
-            token_ids = self._token_bytes_to_ids(seq_tokens)
-            all_ids.extend(token_ids)
+            if self.max_pretoken_bytes is not None:
+                pieces = self._split_long_pretoken(pretoken)
+            else:
+                pieces = [pretoken]
+            for piece in pieces:
+                seq_tokens = self._encode_pretoken_to_tokens(piece)
+                token_ids = self._token_bytes_to_ids(seq_tokens)
+                all_ids.extend(token_ids)
         return all_ids
     
     def encode(self, text: str):

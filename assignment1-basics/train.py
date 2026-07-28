@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-heads", type=int, default=16)
     p.add_argument("--d-ff", type=int, default=1344)
     p.add_argument("--rope-theta", type=float, default=10000.0)
+    p.add_argument("--no-layer-norm", action="store_true", help="ablation: remove all RMSNorm")
+    p.add_argument("--no-pre-norm", action="store_true", help="ablation: post-norm instead of pre-norm")
+    p.add_argument("--no-pos-emb", action="store_true", help="ablation: remove RoPE")
+    p.add_argument("--no-swiglu", action="store_true", help="ablation: plain SiLU FFN (d_ff=4*d_model)")
     # optimizer
     p.add_argument("--lr", type=float, default=1e-3, help="max learning rate (peak of the schedule)")
     p.add_argument("--min-lr", type=float, default=1e-4, help="final learning rate of the schedule")
@@ -118,6 +122,10 @@ def main():
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
+        use_layer_norm=not args.no_layer_norm,
+        pre_norm=not args.no_pre_norm,
+        use_rope=not args.no_pos_emb,
+        use_swiglu=not args.no_swiglu,
     ).to(args.device)
     num_params = sum(p.numel() for p in model.parameters())
 

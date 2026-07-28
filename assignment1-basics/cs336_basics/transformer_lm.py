@@ -12,6 +12,9 @@ class TransformerLM(nn.Module):
     完整的 Transformer 语言模型 (Pre-Norm + RoPE)
     数据流: token ids -> Embedding -> N x TransformerBlock -> 最终 RMSNorm -> LM Head -> logits
     属性命名与参考实现的 state_dict 键一致, 可直接 load_state_dict
+
+    消融开关(默认值 = 原始行为): use_layer_norm / pre_norm / use_rope / use_swiglu,
+    含义见 TransformerBlock。
     """
 
     def __init__(
@@ -25,6 +28,10 @@ class TransformerLM(nn.Module):
             rope_theta: float,
             device=None,
             dtype=None,
+            use_layer_norm: bool = True,
+            pre_norm: bool = True,
+            use_rope: bool = True,
+            use_swiglu: bool = True,
             ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -47,12 +54,19 @@ class TransformerLM(nn.Module):
                 d_ff=d_ff,
                 theta=rope_theta,
                 max_seq_len=context_length,
+                use_layer_norm=use_layer_norm,
+                pre_norm=pre_norm,
+                use_rope=use_rope,
+                use_swiglu=use_swiglu,
             )
             for _ in range(num_layers)
         ])
 
         # 输出前的最终归一化
-        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ln_final = (
+            RMSNorm(d_model, device=device, dtype=dtype)
+            if use_layer_norm else nn.Identity()
+        )
 
         # 输出投影: d_model -> vocab_size, 返回 raw logits (不做 softmax)
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
