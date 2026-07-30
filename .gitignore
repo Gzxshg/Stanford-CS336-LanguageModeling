@@ -5,3 +5,10 @@ assignment1-basics/data/TinyStoriesV2-GPT4-train.txt
 assignment1-basics/data/owt_valid.txt
 assignment1-basics/tinystories_merges.pkl
 assignment1-basics/tinystories_vocab.pkl
+assignment1-basics/owt_merges.pkl
+assignment1-basics/owt_vocab.pkl
+assignment1-basics/*.pkl
+
+# training checkpoints and tokenized datasets
+assignment1-basics/checkpoints*/
+assignment1-basics/data/*.npy
