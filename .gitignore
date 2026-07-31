@@ -12,3 +12,13 @@ assignment1-basics/*.pkl
 # training checkpoints and tokenized datasets
 assignment1-basics/checkpoints*/
 assignment1-basics/data/*.npy
+# assignment2-systems: Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+wandb/
