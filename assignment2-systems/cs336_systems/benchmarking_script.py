@@ -6,6 +6,7 @@ import torch.cuda.nvtx as nvtx
 import timeit
 import statistics
 import argparse
+from contextlib import nullcontext
 
 hyper_model_para_dict={
     "small": {
@@ -56,16 +57,22 @@ hyper_model_para_dict={
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--model_size", choices=["small", "medium", "large", "xl", "10B"], type=str, default="small", help="model size")
-parser.add_argument("--mode", choices=["forward-only", "forward-and-backward", "full-training-steps"], type=str, default="forward-only", help="mode, forward-only or forward-and-backward or full-training-steps")
+parser.add_argument("--mode", choices=["forward-only", "forward-and-backward", "full-training-steps", "forward-save"], type=str, default="forward-only", help="mode, forward-only or forward-and-backward or full-training-steps; forward-save runs the forward pass with grad enabled (keeping autograd residuals alive) but no backward")
 parser.add_argument("--warmup_steps", type=int, default=5, help="number of warmup steps")
 parser.add_argument("--measurement_steps", type=int, default=10, help="number of measurement steps")
 parser.add_argument("--context_length", type=int, default=None, help="override the context length (default: model config value)")
 parser.add_argument("--batch_size", type=int, default=4, help="batch size")
 parser.add_argument("--annotate", action="store_true", help="swap in an NVTX-annotated scaled_dot_product_attention")
+parser.add_argument("--mixed_precision", action="store_true", help="run the forward pass under torch.autocast with bfloat16")
+parser.add_argument("--memory_profile", action="store_true", help="record CUDA memory history during the measurement steps and dump a snapshot pickle")
 args=parser.parse_args()
 
 model_config=hyper_model_para_dict[args.model_size]
 context_length=args.context_length if args.context_length is not None else model_config["context_length"]
+
+# BF16 autocast when requested, no-op context otherwise. Autocast only wraps the forward
+# pass: op dtypes recorded in the autograd graph during forward fully determine backward.
+mp_ctx = (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)) if args.mixed_precision else nullcontext
 
 scaled_test_GPT=BasicsTransformerLM(
     vocab_size=model_config["vocab_size"],
@@ -108,9 +115,10 @@ grad_ctx = torch.inference_mode if args.mode == "forward-only" else torch.enable
 
 for i in range(args.warmup_steps):
     with grad_ctx():
-        warm_up_y_pred=scaled_test_GPT(x)
-        warm_up_loss=cross_entropy(warm_up_y_pred,y_labels)
-    if args.mode=="forward-only":
+        with mp_ctx():
+            warm_up_y_pred=scaled_test_GPT(x)
+            warm_up_loss=cross_entropy(warm_up_y_pred,y_labels)
+    if args.mode in ("forward-only", "forward-save"):
         continue
     warm_up_loss.backward()
     if args.mode=="full-training-steps":
@@ -121,15 +129,21 @@ forward_times=[]
 backward_times=[]
 optimizer_times=[]
 
+if args.memory_profile:
+    # Record allocation history for the measurement phase only (warmup excluded),
+    # then dump a snapshot loadable at pytorch.org/memory_viz.
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
+
 for i in range(args.measurement_steps):
     with nvtx.range("measure"):
         torch.cuda.synchronize()
         t_start=timeit.default_timer()
 
         with grad_ctx():
-            with nvtx.range("forward"):
-                y_pred=scaled_test_GPT(x)
-                loss=cross_entropy(y_pred,y_labels)
+            with mp_ctx():
+                with nvtx.range("forward"):
+                    y_pred=scaled_test_GPT(x)
+                    loss=cross_entropy(y_pred,y_labels)
         torch.cuda.synchronize()
         t_forward=timeit.default_timer()
 
@@ -155,6 +169,14 @@ for i in range(args.measurement_steps):
 
     if args.mode=="full-training-steps":
         optimizer_times.append(t_end - t_backward)
+
+if args.memory_profile:
+    snapshot_name = f"memory_{args.model_size}_ctx{context_length}_{args.mode}{'_bf16' if args.mixed_precision else ''}.pickle"
+    torch.cuda.memory._dump_snapshot(snapshot_name)
+    torch.cuda.memory._record_memory_history(enabled=None)
+    print("Memory snapshot saved to", snapshot_name)
+    print("peak memory allocated (MiB):", torch.cuda.max_memory_allocated() / 2**20)
+
 print("Average forward time:",sum(forward_times)/len(forward_times))
 print("forward time deviation",statistics.stdev(forward_times))
 print("origin forward time",forward_times)
