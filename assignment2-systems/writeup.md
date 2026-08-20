@@ -235,3 +235,66 @@ one FP32 gradient per parameter, and each block holds 26.2 M parameters × 4 B =
 backward each block therefore frees ~85 MiB of residuals while allocating ~100 MiB of gradients —
 net active memory *rises* slightly through the backward pass, which is exactly what the training-step
 timeline shows.
+
+---
+
+# 3.2 Activation Checkpointing
+
+## gradient_checkpointing (a): Memory-optimal strategy with nested checkpointing
+
+The memory-optimal strategy is recursive binary ("tree") checkpointing: split the stack of N blocks
+in half, wrap each half in its own `checkpoint` call, and recurse until a segment contains a single
+block, which runs normally. At any moment only the checkpoints along the current recursion path are
+alive — one per level, i.e. O(log N) checkpoint tensors of size c — plus the residuals of the single
+leaf block currently being recomputed, so peak activation memory is O(c·log N + M) = O(log N), down
+from O(N) without checkpointing and O(√N) with a single checkpointing level. The price is compute:
+each level of nesting adds one more recomputation of the segments below it, so each block is
+recomputed O(log N) times and total compute rises from Θ(N) to Θ(N log N) (T(N) = 2T(N/2) + Θ(N)).
+Binary splitting is optimal because, with a levels and m-way splits, peak memory ≈ a·m·N^{1/a} subject
+to m^a = N, which is minimized at a small constant m and a = Θ(log N).
+
+```python
+def run_segment(blocks, x, lo, hi):
+    if hi - lo == 1:
+        return blocks[lo](x)            # leaf: run one block normally (residuals saved)
+    mid = (lo + hi) // 2
+    x = checkpoint(lambda t: run_segment(blocks, t, lo, mid), x, use_reentrant=False)
+    x = checkpoint(lambda t: run_segment(blocks, t, mid, hi), x, use_reentrant=False)
+    return x
+
+y = run_segment(blocks, x, 0, N)        # peak memory O(log N), compute O(N log N)
+```
+
+## gradient_checkpointing (b): Best single-level checkpointing granularity
+
+Setup: `cs336_systems/checkpointing_script.py` wraps every k consecutive TransformerBlocks in one
+`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` segment and measures peak GPU memory
+of a forward+backward step via `torch.cuda.max_memory_allocated` (batch 4, FP32; AdamW states are
+skipped — they add a k-independent constant and do not affect the comparison).
+
+Constraint note: the handout's xl @ ctx 2048 configuration cannot run forward+backward on a 24 GiB
+RTX 3090 even with per-block checkpointing — parameters + gradients alone are 20.4 GiB, and adding
+2.5 GiB of checkpoints plus one block's recomputed residuals (~3.65 GiB) exceeds the card (verified:
+k=1 probe OOMs). The sweep was therefore run on the **medium** model (N=24 blocks), which has an
+identical trade-off structure, at ctx 512 (ctx 2048 points that fit the shared card showed the same
+shape; larger-k ctx-2048 runs were evicted by co-tenant memory pressure).
+
+Measured peak memory (MiB) vs. segment size k:
+
+| k (blocks/ckpt) | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 24 (=all) | 0 (off) |
+|---|---|---|---|---|---|---|---|---|---|
+| peak (MiB) | 3712.7 | 4017.4 | 4322.0 | 4626.6 | 5235.9 | 5845.2 | 7063.7 | OOM | OOM |
+
+![peak vs k](writeup_assets/checkpoint_sweep.png)
+
+The optimum is **k = 1 (checkpoint every block)**, and the neighbors confirm it: k=2 costs +305 MiB
+and k=3 +609 MiB, while disabling checkpointing (or using one giant segment) needs ~13 GiB and OOMs
+on the shared card. The measured peaks fit peak(k) = 304.6·k + 3408 MiB almost exactly — i.e. the
+short-term term k·M (M ≈ 305 MiB of residuals per block) grows linearly while the long-term term
+(N/k)·c (c = 8.4 MiB per checkpoint) is negligible here, so the balance point
+k\* = √(cN/M) ≈ √(8.4·24/305) ≈ 0.8 rounds to k = 1. Because M ≫ c for Transformer blocks (the
+block's residuals dwarf one residual-stream tensor), single-level checkpointing should always use
+the finest granularity; coarser segments only pay off when checkpoint storage is comparatively
+expensive. The same arithmetic for xl @ 2048 (c = 80 MiB, M ≈ 3.65 GiB) likewise gives k\* < 1 →
+checkpoint every block, which needs ≈ 20.4 + 2.5 + 3.65 ≈ 26.5 GiB — feasible on the course's
+40/80 GiB GPUs, just not on a 24 GiB 3090.
