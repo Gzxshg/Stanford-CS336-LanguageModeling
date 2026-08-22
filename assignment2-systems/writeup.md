@@ -298,3 +298,174 @@ the finest granularity; coarser segments only pay off when checkpoint storage is
 expensive. The same arithmetic for xl @ 2048 (c = 80 MiB, M ≈ 3.65 GiB) likewise gives k\* < 1 →
 checkpoint every block, which needs ≈ 20.4 + 2.5 + 3.65 ≈ 26.5 GiB — feasible on the course's
 40/80 GiB GPUs, just not on a 24 GiB 3090.
+
+---
+
+# 4.1 Benchmarking PyTorch Attention
+
+## pytorch_attention
+
+Setup: `cs336_systems/attention_benchmarking_script.py` benchmarks
+`cs336_basics.model.scaled_dot_product_attention` (batch 8, no head dimension, FP32, 5 warmup +
+100 timed iterations, `torch.cuda.synchronize()` around each pass), sweeping
+d_model × seq_len. GPU: RTX 3090 24 GiB **shared with a ~13.4 GiB co-tenant** (effective capacity
+~10 GiB), which lowers the measured OOM boundary (see analysis below).
+
+Timings (ms per pass, mean of 100) and memory in use right before backward (MiB):
+
+| d_model | seq_len | fwd (ms) | bwd (ms) | mem before bwd (MiB) |
+|---|---|---|---|---|
+| 16  | 256   | 0.87 | 3.30  | 20.8 |
+| 16  | 1024  | 2.33 | 4.64  | 82.3 |
+| 16  | 4096  | 14.18 | 35.20 | 1048.6 |
+| 16  | 8192+ | OOM  | OOM   | OOM |
+| 32  | 256   | 0.91 | 2.53  | 21.3 |
+| 32  | 1024  | 2.40 | 5.57  | 84.3 |
+| 32  | 4096  | 13.27 | 33.49 | 1056.6 |
+| 32  | 8192+ | OOM  | OOM   | OOM |
+| 64  | 256   | 0.64 | 1.85  | 22.3 |
+| 64  | 1024  | 2.13 | 3.17  | 88.3 |
+| 64  | 4096  | 14.08 | 34.18 | 1072.6 |
+| 64  | 8192+ | OOM  | OOM   | OOM |
+| 128 | 256   | 0.61 | 1.11  | 24.3 |
+| 128 | 1024  | 0.86 | 2.60  | 96.3 |
+| 128 | 4096  | 15.71 | 35.87 | 1104.6 |
+| 128 | 8192+ | OOM  | OOM   | OOM |
+
+**Memory accounting (smallest OOM config: d=16, S=8192, batch 8, FP32).** The naïve implementation
+materializes the S×S score matrix S = QKᵀ (B·S²·4 B = 8·8192²·4 = 2048 MiB) and softmax's output P
+(another 2048 MiB) which is saved for backward; backward additionally materializes dP and dS of the
+same size. So the pass needs ≳ 3–4 × 2048 MiB ≈ 6–8 GiB of attention-matrix memory alone — over the
+~10 GiB available on the shared card, hence OOM. On an empty 24 GiB card this config would just fit;
+S=16384 (P alone is 8·16384²·4 B = 8.6 GiB, and > 20 GiB with its gradient twins) is where even an
+empty card runs out.
+
+**Response.** Memory saved for backward grows quadratically with sequence length (measured
+"before-backward" usage: 20.8 → 82.3 → 1048.6 MiB as S goes 256 → 1024 → 4096, i.e. ×16 per ×4 in S,
+matching B·S² scaling), while the runtimes at fixed S barely depend on d_model — the pass is dominated
+by reading/writing the S² score/softmax matrices, i.e. it is memory-bandwidth-bound, not compute-bound.
+To eliminate this cost we must stop materializing P and S in HBM altogether: compute attention in tiles
+with an online softmax and recompute P during backward from Q, K, V and the logsumexp L — exactly the
+FlashAttention-2 approach implemented below in Section 4.2.
+
+## 4.2 Benchmarking JIT-Compiled Attention (torch_compile)
+
+### (a) Compiled attention vs. uncompiled
+
+Same sweep as `pytorch_attention`, with `torch.compile` wrapped around the attention function
+(batch 8, FP32, 100 iterations, RTX 3090, shared card):
+
+| d_model | seq_len | fwd eager (ms) | fwd compiled (ms) | bwd eager (ms) | bwd compiled (ms) |
+|---|---|---|---|---|---|
+| 16  | 256  | 0.87  | 0.60  | 3.30  | 1.68 |
+| 16  | 1024 | 2.33  | 0.62  | 4.64  | 2.44 |
+| 16  | 4096 | 14.18 | 6.99  | 35.20 | 16.12 |
+| 32  | 256  | 0.91  | 1.02  | 2.53  | 1.88 |
+| 32  | 1024 | 2.40  | 0.90  | 5.57  | 1.93 |
+| 32  | 4096 | 13.27 | 8.82  | 33.49 | 19.34 |
+| 64  | 256  | 0.64  | 1.04  | 1.85  | 2.54 |
+| 64  | 1024 | 2.13  | 1.53  | 3.17  | 5.06 |
+| 64  | 4096 | 14.08 | 8.52  | 34.18 | 18.26 |
+| 128 | 256  | 0.61  | 0.42  | 1.11  | 0.65 |
+| 128 | 1024 | 0.86  | 1.23  | 2.60  | 1.90 |
+| 128 | 4096 | 15.71 | 10.37 | 35.87 | 23.04 |
+
+Compiling attention gives ~1.5–2× speedup at the memory-bound long-sequence end (S=4096: forward
+14.2→7.0–10.4 ms, backward 35→16–23 ms), since Inductor fuses the scale/mask/softmax elementwise
+chain into fewer HBM round-trips; at small sizes the picture is mixed (launch overheads dominate).
+Crucially, memory usage and the OOM boundary are unchanged (compiled P is still materialized and
+saved: same 1048.6 MiB before backward at S=4096, same OOM at S=8192) — the compiler does not
+invent the online-softmax/tiled algorithm, which is the motivation for writing the FlashAttention-2
+kernel by hand.
+
+### (b) Compiling the whole Transformer
+
+The end-to-end `benchmarking_script.py` was given a `--compile` flag that wraps the entire
+`BasicsTransformerLM` in `torch.compile`. Measurements at ctx 512, batch 4 (RTX 3090, shared card;
+medium fwd+bwd did not fit alongside co-tenants during this window, so medium is forward-only):
+
+| model | phase | vanilla (ms) | compiled (ms) | speedup |
+|---|---|---|---|---|
+| small  | forward       | 78.4  | 55.7  | 1.41× |
+| small  | backward      | 157.5 | 101.6 | 1.55× |
+| small  | optimizer     | 61.4  | 46.7  | 1.32× |
+| small  | **full step** | 297.3 | 203.8 | 1.46× |
+| medium | forward       | 191.0 | 180.4 | 1.06× |
+| large  | forward       | 398.0 | 292.3 | 1.36× |
+
+Compiling the whole model speeds up every phase of the training step: small's full step goes from
+297 ms to 204 ms (1.46×), with backward benefiting most (1.55×) because Inductor fuses the long
+elementwise chains (RoPE rotations, SwiGLU, residual adds, and the pointwise AdamW update). The
+medium forward run coincided with heavy co-tenant contention on the shared GPU and shows almost no
+gain (1.06×), while the cleaner large forward comparison shows 1.36× — overall consistent with the
+attention-level table: the compiler reclaims part of the non-GEMM overhead identified in the nsys
+profiling (Section 2.1.4), but cannot remove the quadratic attention memory traffic, which is what
+the hand-written FlashAttention-2 kernel below addresses.
+
+---
+
+# 4.2.2 FlashAttention-2 (flash_forward, flash_backward, flash_benchmarking)
+
+## flash_forward
+
+- **(a) Pure-PyTorch reference** (`cs336_systems/flash_attention.py: FlashAttentionPyTorch`): tiled
+  forward following Algorithm 1 — loop over query tiles, inner loop over key/value tiles, running
+  max `m` and denominator proxy `l` with rescaling; saves Q, K, V, O, L. Passes
+  `test_flash_forward_pass_pytorch`.
+- **(b) Fused Triton kernel** (`cs336_systems/flash_attention_triton.py: flash_fwd_kernel`):
+  launch grid `(T_q, batch)`, a single loop over key tiles, fp32 on-chip accumulators
+  (`O_i`, `l`, `m`), `tl.dot` for both matmuls with `P̃` cast to V's dtype before multiplying, and
+  the output cast on store. Passes `test_flash_forward_pass_triton[False]`.
+- **(c) Causal masking**: `is_causal: tl.constexpr` kernel parameter; query/key index vectors
+  compared inside the kernel to form the Bq×Bk mask, masked scores get `-1e6` added before the
+  running max. Passes `test_flash_forward_pass_triton[True]`.
+
+## flash_backward
+
+Backward is implemented in PyTorch with `torch.compile` (per the handout, not Triton), following
+Eqs. 13–19 with recomputation: `P = exp(S − L)` is recomputed from the saved logsumexp `L` instead
+of being stored, and `D = rowsum(O ∘ dO)` is precomputed; internally FP32 with casts at the
+boundary. Passes `test_flash_backward_pytorch` and `test_flash_backward_triton[False/True]`.
+
+## flash_benchmarking
+
+`cs336_systems/flash_benchmarking_script.py` uses `triton.testing.do_bench` (median), batch 1,
+causal masking, sweeping seq_len (128–65536) × d (16–128) × {bf16, fp32}. Note: measured on a
+shared RTX 3090 instead of the handout's B200, and the backward of the Triton implementation is the
+PyTorch reference above (which still materializes S×S — see the OOM(bwd) rows). Representative
+rows (d=64; full table: `profiles/flash_benchmark.csv`):
+
+**bfloat16**
+
+| seq_len | triton fwd | triton bwd | triton e2e | pytorch fwd | pytorch bwd | pytorch e2e |
+|---|---|---|---|---|---|---|
+| 128   | 0.009  | 1.15   | 1.16   | 0.21  | 3.72   | 3.93 |
+| 1024  | 0.037  | 0.47   | 0.50   | 0.38  | 3.93   | 4.32 |
+| 4096  | 0.147  | 3.08   | 3.23   | 4.19  | 1.76   | 5.95 |
+| 16384 | 1.68   | 43.56  | 45.25  | 8.52  | 35.07  | 43.60 |
+| 32768 | 13.16  | OOM    | —      | 81.07 | OOM    | — |
+| 65536 | 44.41  | OOM    | —      | OOM   | —      | — |
+
+**float32**
+
+| seq_len | triton fwd | triton bwd | triton e2e | pytorch fwd | pytorch bwd | pytorch e2e |
+|---|---|---|---|---|---|---|
+| 128   | 0.010  | 0.05   | 0.06   | 0.44  | 0.57   | 1.01 |
+| 1024  | 0.042  | 0.67   | 0.72   | 0.31  | 3.27   | 3.58 |
+| 4096  | 0.210  | 2.46   | 2.67   | 3.52  | 6.10   | 9.62 |
+| 16384 | 8.03   | 28.28  | 36.31  | 17.22 | 37.57  | 54.79 |
+| 32768 | 16.85  | OOM    | —      | OOM   | —      | — |
+| 65536 | 90.96  | OOM    | —      | OOM   | —      | — |
+
+![forward scaling](writeup_assets/flash_fwd_scaling.png)
+
+The Triton forward is faster than the naïve PyTorch forward at essentially every configuration —
+~5–30× at short sequences (kernel-count/launch bound: one fused kernel vs. ~6 kernels) and ~2–5×
+once the S×S memory traffic dominates (e.g. fp32 d=64 S=16384: 8.0 vs 17.2 ms) — and it keeps
+scaling to seq_len 65536 where the naïve version cannot even run its forward pass, since the S×S
+matrix is never materialized (the naïve forward OOMs at S=32768 in fp32 on the 24 GiB card). The
+backward latencies tell the second half of the story: our handout-specified backward is a PyTorch
+recompute pass that *does* materialize S×S, so it dominates the end-to-end time at long S and OOMs
+from S=32768 onward (`OOM(bwd)` rows) — which is exactly why the optional Triton backward
+(Algorithm 2) exists for leaderboard-scale sequences. Small-S backward numbers (and a few small-S
+rows) are noisy: µs-scale measurements on a shared GPU.

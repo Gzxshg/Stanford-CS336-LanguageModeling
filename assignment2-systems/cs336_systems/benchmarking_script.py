@@ -65,6 +65,7 @@ parser.add_argument("--batch_size", type=int, default=4, help="batch size")
 parser.add_argument("--annotate", action="store_true", help="swap in an NVTX-annotated scaled_dot_product_attention")
 parser.add_argument("--mixed_precision", action="store_true", help="run the forward pass under torch.autocast with bfloat16")
 parser.add_argument("--memory_profile", action="store_true", help="record CUDA memory history during the measurement steps and dump a snapshot pickle")
+parser.add_argument("--compile", action="store_true", help="torch.compile the whole model")
 args=parser.parse_args()
 
 model_config=hyper_model_para_dict[args.model_size]
@@ -82,6 +83,9 @@ scaled_test_GPT=BasicsTransformerLM(
     num_layers=model_config["num_layers"],
     num_heads=model_config["num_heads"]
 ).to("cuda")
+
+if args.compile:
+    scaled_test_GPT = torch.compile(scaled_test_GPT)
 
 if args.annotate:
     import math
