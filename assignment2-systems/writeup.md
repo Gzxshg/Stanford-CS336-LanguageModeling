@@ -469,3 +469,195 @@ recompute pass that *does* materialize S×S, so it dominates the end-to-end time
 from S=32768 onward (`OOM(bwd)` rows) — which is exactly why the optional Triton backward
 (Algorithm 2) exists for leaderboard-scale sequences. Small-S backward numbers (and a few small-S
 rows) are noisy: µs-scale measurements on a shared GPU.
+
+## Distributed Communication, Single Node (5.1, `distributed_communication_single_node`)
+
+### Setup
+
+Script: `cs336_systems/distributed_communication_single_node.py`. One process per GPU via `mp.spawn`,
+NCCL backend, per-rank device binding with `torch.cuda.set_device(rank)`. Float32 tensors of
+1 / 10 / 100 / 1024 MiB are all-reduced (summed) across the process group; each configuration runs
+5 warm-up calls followed by 20 timed calls, every timed call bracketed by
+`torch.cuda.synchronize()` (`async_op=False` only guarantees the operation is *queued* on the GPU,
+not completed). Per-rank timings are collected on rank 0 with `dist.all_gather_object` and
+aggregated across ranks and iterations. Full data: `profiles/allreduce_benchmark.csv`.
+
+Hardware caveats: only 4 of the 7 installed RTX 3090s were usable (GPUs 4–6 report `ERR` in
+`nvidia-smi` and are excluded by the CUDA runtime), so the 6-GPU configuration could not be run.
+The 2-GPU run used the two idle GPUs (0 and 3, `CUDA_VISIBLE_DEVICES=0,3`); the 4-GPU run
+necessarily included GPUs 1 and 2, which were 94–100% busy with other tenants' jobs, so the 4-GPU
+numbers are inflated by contention.
+
+### Results
+
+| data size | 2 GPUs time (ms) | 2 GPUs busbw (GB/s) | 4 GPUs time (ms) | 4 GPUs busbw (GB/s) |
+|---|---|---|---|---|
+| 1MB   | 0.98   | 1.07 | 4.58    | 0.34 |
+| 10MB  | 3.29   | 3.19 | 12.68   | 1.24 |
+| 100MB | 30.85  | 3.40 | 117.07  | 1.34 |
+| 1GB   | 304.36 | 3.53 | 1180.46 | 1.36 |
+
+(Per-call mean across ranks and iterations; busbw = algbw × 2(P−1)/P for ring all-reduce.)
+
+![all-reduce scaling](writeup_assets/allreduce_benchmark.png)
+
+### Commentary
+
+Small messages are latency-bound: at 1MB the call costs ~1 ms on 2 GPUs — barely less than 10MB —
+and grows with world size (4.58 ms on 4 GPUs) because a ring all-reduce needs 2(P−1) sequential
+communication steps whose fixed per-step overhead dominates; this is exactly why Section 5.3
+batches gradients into fewer, larger all-reduce calls. Large messages are bandwidth-bound: from
+100MB to 1GB the runtime scales almost exactly linearly (×10) and busbw saturates (~3.5 GB/s at 2
+GPUs), so time ≈ size / bandwidth. The two factors interact multiplicatively: per-rank ring
+traffic grows as 2(P−1)/P, so 4 GPUs should cost only ~1.5× more than 2 at large sizes at equal
+link bandwidth — we measure ~3.9× because the 4-GPU ring additionally suffered contention from
+co-resident jobs (busbw 1.36 vs. 3.53 GB/s) and spans more non-P2P PCIe links; the 2-GPU 1MB row
+also shows a mean far above its median (0.98 vs. 0.42 ms, max 11.7 ms), a reminder that
+small-message timings have heavy tails and medians are the more robust statistic.
+
+## Naïve DDP (5.2, `naive_ddp` / `naive_ddp_benchmarking`)
+
+### Implementation
+
+`cs336_systems/naive_ddp.py` implements a minimal `DDP(nn.Module)` container: at construction it
+broadcasts the wrapped module's `state_dict()` (parameters and buffers) from rank 0 so all
+replicas start identical, and `finish_gradient_synchronization()` — invoked via the
+`ddp_on_after_backward` adapter after `loss.backward()` and before `optimizer.step()` — issues one
+all-reduce (SUM, then division by world size) per parameter tensor, skipping parameters without
+gradients (`requires_grad=False`). `pytest tests/test_ddp.py` passes 5/5 runs (both `ToyModel` and
+the tied-weight variant), confirming bitwise agreement with the single-process full-batch baseline.
+
+### Benchmarking setup
+
+Script: `cs336_systems/naive_ddp_benchmarking.py`. 1 node × 2 GPUs (NCCL, one process per
+GPU, the two idle GPUs 0/1 via `CUDA_VISIBLE_DEVICES=0,1`), global batch 4 (2 per rank), ctx 512,
+FP32, AdamW (lr 1e-4), 5 warm-up + 10 measured steps, every segment bracketed by
+`torch.cuda.synchronize()`, timings aggregated across ranks with `dist.all_gather_object`. The
+handout specifies the xl model, but xl (3.41B params) needs ~25.4 GiB for FP32 parameters +
+gradients alone — more than the 23.6 GiB usable on these RTX 3090s — so we substitute large
+(0.97B params, ~14.4 GiB static FP32 training state including AdamW moments), the same
+substitution as in the memory-profiling section.
+
+### Results
+
+| segment per training step | time (ms) |
+|---|---|
+| forward             | 151.1 |
+| backward            | 307.6 |
+| gradient all-reduce | 1178.7 |
+| optimizer step      | 169.7 |
+| **total**           | **1807.2** |
+
+Peak GPU memory: 19.44 GiB. Gradient communication accounts for **65.2%** of the step — 2.6× the
+forward+backward compute time (458.8 ms). Full data: `profiles/naive_ddp_benchmark.csv`.
+
+### Commentary
+
+The profile matches the two limitations called out in Section 5.3. The gradients are 0.97B params ×
+4 B = 3.88 GB per step, all-reduced as 327 separate per-tensor calls (36 layers × 9 — 4 attention
+projections, 2 RMSNorm, 3 FFN weights — plus embedding, final norm and LM head; sizes range from
+5 KB norms to 49 MB embeddings, median ~6 MB); the effective bandwidth
+(~3.3 GB/s) is already close to the ~3.5 GB/s saturation measured in Section 5.1, so the
+communication time is mostly unavoidable data movement — but it is *serialized* after the backward
+pass, adding ~1.2 s of pure overhead per step. Since the backward pass produces gradients
+incrementally (last layer first), overlapping each all-reduce with the remaining backward
+computation (5.3.2) could in principle hide almost all of it behind the 308 ms of backward compute,
+and batching small tensors into fewer calls (5.3.1) removes per-call latency — together these
+should bring the step time close to the ~630 ms single-GPU compute+optimizer time.
+
+## Minimal DDP with Flat Gradients (5.3.1, `minimal_ddp_flat_benchmarking`)
+
+### Setup
+
+Same harness and configuration as the naïve benchmark (large model, 1 node × 2 GPUs, global
+batch 4, ctx 512, FP32, AdamW; both variants re-measured back-to-back on idle GPUs 0/1), but
+`DDP(flat_gradients=True)` concatenates all parameter gradients into one contiguous buffer
+(`torch._utils._flatten_dense_tensors`), issues a *single* all-reduce per step, divides by world
+size, and copies the results back (`torch._utils._unflatten_dense_tensors` + `copy_`). Script:
+`cs336_systems/minimal_ddp_flat_benchmarking.py` (shares the naïve benchmark's timing worker);
+data: `profiles/minimal_ddp_flat_benchmark.csv`. Correctness of the flat path was verified against
+a single-process full-batch baseline (3 steps, 2 ranks, bitwise-comparable parameters), and
+`tests/test_ddp.py` still passes.
+
+Memory note: the flat buffer costs an extra 3.61 GiB on top of a 19.4 GiB baseline, and with the
+default allocator the repeated 3.6 GiB alloc/free per step fragmented memory enough to OOM
+(*Tried to allocate 3.61 GiB*; 6.2 GiB reserved-but-unallocated). Re-running with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` fixed it — a concrete demonstration that
+flattening trades memory (and two full extra copies per step) for fewer communication calls.
+
+### Results
+
+| per training step | naïve (per-param) | flat (single call) |
+|---|---|---|
+| gradient communication (ms) | 1178.7 | 1080.2 |
+| total step (ms)             | 1807.2 | 1708.5 |
+| communication share         | 65.2%  | 63.2%  |
+| effective bandwidth (GB/s)  | 3.29   | 3.59   |
+| peak GPU memory (GiB)       | 19.44  | 19.16¹ |
+
+¹ Measured with `expandable_segments:True`; the flat run otherwise OOMs from fragmentation (see
+above).
+
+### Commentary
+
+Batching all gradients into one 3.88 GB all-reduce cuts the communication time by 8.4% (1178.7 →
+1080.2 ms) and the total step by 5.5% (1807.2 → 1708.5 ms), pushing the effective bandwidth from
+3.29 to 3.59 GB/s — right at the ~3.5 GB/s saturation we measured for large messages in
+Section 5.1. The gain is modest because the average per-parameter message in this model is already
+~13 MB, near the bandwidth-bound regime, so per-call latency was never the dominant cost here (it
+would matter much more for models with many tiny tensors). The remaining ~1.1 s of communication is
+pure bandwidth-bound data movement that no amount of batching can remove — hiding it behind the
+backward pass (5.3.2) is the only way forward.
+
+## DDP with Overlapping Communication (5.3.2, `ddp_overlap_individual_parameters` + `ddp_overlap_individual_parameters_benchmarking`)
+
+### Implementation
+
+`cs336_systems/ddp_overlap_individual_parameters.py` implements `DDPOverlap`, a container with the
+same contract as the naïve `DDP` (broadcast initial state from rank 0 at construction;
+`finish_gradient_synchronization()` called after `backward()` and before `optimizer.step()`). At
+construction it registers a `register_post_accumulate_grad_hook` on every parameter that requires
+gradients; the hook fires the moment that parameter's gradient is fully accumulated during the
+backward pass and immediately issues an *asynchronous* all-reduce (`async_op=True`), so
+communication runs concurrently with the backward computation of the remaining layers.
+`finish_gradient_synchronization()` waits on the outstanding handles and divides the gradients by
+the world size (same numerics as the naïve version). Autograd runs a single AccumulateGrad node per
+leaf parameter per backward, so hooks fire exactly once per parameter — even with tied weights —
+and in the same order on every rank. `pytest tests/test_ddp.py` passes 5/5 runs with `get_ddp`
+returning `DDPOverlap`.
+
+### (a) Benchmark
+
+Same setup as before (large, 1 node × 2 GPUs, global batch 4, ctx 512, FP32, AdamW; all three
+variants re-measured back-to-back on idle GPUs 0/1). For the overlap row the "backward" segment
+includes the launch of gradient communication (the closing `torch.cuda.synchronize()` also waits on
+in-flight NCCL kernels), and "grad sync" measures only the residual wait:
+
+| per training step (ms) | naïve | flat (5.3.1) | overlap |
+|---|---|---|---|
+| forward        | 150.9  | 150.8  | 151.3 |
+| backward       | 307.7  | 308.2  | 1174.9 |
+| gradient sync  | 1180.4 | 1063.5 | 10.2 |
+| optimizer step | 169.7  | 169.6  | 169.5 |
+| **total**      | 1808.6 | 1692.0 | **1505.9** |
+
+Overlapping cuts the total step by 16.7% vs. naïve (1808.6 → 1505.9 ms). The saving is ~303 ms ≈
+the entire backward compute time (308 ms) — exactly the theoretical ceiling for this overlap:
+communication (3.88 GB at ~3.5 GB/s bus bandwidth ≈ 1.1 s) now fully covers the backward pass, the
+residual wait after `backward()` returns is only 10 ms, and the step is bounded by forward +
+communication + optimizer (151 + 1180 + 170 ≈ 1501 ms ≈ measured). Going further would require
+reducing the communication volume itself (lower-precision gradients) or faster interconnect, since
+bandwidth — not launch overhead or serialization — is now the bottleneck. Data:
+`profiles/ddp_overlap_benchmark.csv`.
+
+### (b) Profiler comparison
+
+![ddp overlap trace](writeup_assets/ddp_overlap_trace.png)
+
+GPU kernel timelines for one training step (rank 0), from Nsight Systems traces
+(`profiles/ddp_naive_trace.nsys-rep`, `profiles/ddp_overlap_trace.nsys-rep`; figure:
+`profiles/make_ddp_overlap_figure.py`). Top: naïve DDP — the NCCL lane is idle during backward and
+the compute lane is idle during the ~1.2 s gradient sync; the two phases are strictly serial.
+Bottom: overlapped DDP — NCCL all-reduce kernels start as soon as the backward pass begins
+producing gradients and run concurrently with backward compute; the `grad_sync` window shrinks to a
+few milliseconds (the residual handle wait).
