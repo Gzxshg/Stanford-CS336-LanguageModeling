@@ -1,3 +1,39 @@
+# 2.1.3 End-to-End Benchmarking (benchmarking_script)
+
+## (a) The script
+
+`cs336_systems/benchmarking_script.py` initializes a basics Transformer from `--model_size`,
+generates a random batch, and times forward-only / forward+backward / full training steps
+(`--mode`), with `--warmup_steps` (default 5) before `--measurement_steps` (default 10) timed
+steps, calling `torch.cuda.synchronize()` around each timed phase (CUDA calls are asynchronous, so
+unsynchronized wall time would not measure GPU work).
+
+## (b) Timings by model size
+
+Full training step, batch 4, ctx 512, FP32, 5 warm-up + 10 measured steps (data:
+`benchmark_results_20260731_224137.txt`):
+
+| size | forward (ms) | backward (ms) | optimizer step (ms) |
+|---|---|---|---|
+| small  | 24.86 ± 0.02  | 56.81 ± 0.19  | 11.06 ± 1.96 |
+| medium | 83.87 ± 0.07  | 166.37 ± 0.29 | 32.51 ± 0.49 |
+| large  | 169.27 ± 0.49 | 340.40 ± 0.83 | 89.67 ± 0.65 |
+
+The backward pass takes ≈2× the forward, matching its ≈2× FLOP count (grad-input plus grad-weight
+matmuls), and measurement variability is tiny (well under 1% for forward/backward). xl and 10B are
+absent because a full FP32 training step does not fit on 24 GiB (xl needs ≥25.4 GiB for
+parameters+gradients alone — see 2.1.6).
+
+## (c) Effect of skipping warm-up
+
+Repeating the small-model measurement with 0 / 1 / 2 warm-up steps: without warm-up the mean
+forward time jumps from ≈47.7 ms to 81.7 ms with the standard deviation exploding from <1 ms to
+107 ms — the first step pays one-time costs (CUDA context creation, allocator pool growth,
+cuBLAS/kernel autotuning) and dominates the average. One or two warm-up steps already suffice to
+stabilize the small model, but larger models and NCCL communication need more (allocator and
+library caches grow per shape encountered), which is why we keep 5. (Absolute times here are from a
+different GPU/day than (b); only the relative comparison matters.)
+
 # 2.1.4 Nsight Systems Profiling (nsys_profile)
 
 ## Setup
@@ -661,3 +697,245 @@ the compute lane is idle during the ~1.2 s gradient sync; the two phases are str
 Bottom: overlapped DDP — NCCL all-reduce kernels start as soon as the backward pass begins
 producing gradients and run concurrently with backward compute; the `grad_sync` window shrinks to a
 few milliseconds (the residual handle wait).
+
+## Optimizer State Sharding (6, `optimizer_state_sharding` + `optimizer_state_sharding_accounting`)
+
+### Implementation
+
+`cs336_systems/optimizer_state_sharding.py` implements
+`ShardedOptimizer(torch.optim.Optimizer)`. The outer optimizer keeps the *full* parameter list in
+`param_groups` (so `zero_grad` etc. behave normally); `add_param_group` — called by the super-class
+constructor and by any mid-training group additions — assigns each parameter to the rank with the
+smallest currently-assigned element count (greedy, deterministic, identical on all ranks). The
+wrapped optimizer (`optimizer_cls`, here AdamW) is built over only this rank's shard, so optimizer
+states live only on the owner. `step()` runs the inner optimizer (bitwise-identical updates, since
+gradients are already all-reduced) and then synchronizes parameters with one flattened
+`dist.broadcast` per owning rank. `pytest tests/test_sharded_optimizer.py` passes 5/5 runs.
+
+### (a) Peak memory with and without sharding
+
+Script: `cs336_systems/optimizer_state_sharding_accounting.py` (large model as xl substitute,
+1 node × 2 GPUs, global batch 4, ctx 512, FP32, AdamW; each variant in a fresh process group).
+`memory_allocated` at three probe points, per rank:
+
+| probe point | full (GiB) | sharded (GiB) |
+|---|---|---|
+| after model initialization     | 3.72  | 3.72 |
+| directly before optimizer step | 14.77 | 11.06 |
+| directly after optimizer step  | 14.77 | 11.06 |
+| peak during training           | 19.44 | 15.73 |
+
+The numbers match the expected breakdown: parameters 3.72 GiB (0.97B × 4 B) are replicated in both
+variants; before the optimizer step, gradients (~3.7 GiB) and optimizer states are live — AdamW
+keeps two FP32 moments per parameter, i.e. ~7.4 GiB in the full variant but only half that
+(~3.7 GiB) per rank in the sharded variant, which is exactly the measured difference
+(14.77 − 11.06 = 3.71 GiB). Before/after step are equal because states are allocated once and
+reused; peak memory drops by the same 3.7 GiB. With 2 ranks the saving is modest, but it scales as
+1/world_size — the point of ZeRO-style sharding. Data: `profiles/optimizer_state_sharding.csv`.
+
+### (b) Runtime overhead
+
+Per-step timings, same session (note: measured on GPUs 5/6 with a co-tenant job on GPU 6, so
+absolute times are inflated relative to Section 5; both variants share the condition, so the
+comparison is internally valid):
+
+| per training step (ms) | full | sharded |
+|---|---|---|
+| forward                        | 213.2  | 216.6 |
+| backward (incl. overlapped grad comm) | 2095.7 | 2063.5 |
+| residual grad sync             | 15.1   | 15.7 |
+| optimizer step                 | 242.4  | 929.9 |
+| **total**                      | 2566.5 | 3225.7 |
+
+Sharding makes the step **slower** by ~660 ms (+26%): the entire increase is in the optimizer step
+(242 → 930 ms), which now includes broadcasting each owner's updated shard (~1.9 GB per rank at 2
+ranks). On this machine's slow PCIe interconnect (~3.5 GB/s, Section 5.1) that is expensive; the
+trade is ~3.7 GiB less memory per rank for ~660 ms more time per step.
+
+### (c) Differences from ZeRO stage 1 (ZeRO-DP P_os)
+
+Two main differences, both in communication volume and memory. (i) *Gradient communication*: we
+still all-reduce every gradient to every rank (ring volume 2Ψ) even though each rank only needs its
+own shard's gradients, and *then* pay an extra ~Ψ of shard broadcasts after the step (3Ψ total).
+ZeRO stage 1 instead reduce-scatters gradients (Ψ, each rank receives only its shard's reduced
+gradients) and all-gathers the updated parameters (Ψ), keeping total volume at 2Ψ — identical to
+vanilla DDP — so our simplified version moves 1.5× more bytes per step. (ii) *Memory*: we shard
+only the optimizer states, while full parameter and gradient buffers stay replicated on every rank;
+ZeRO can additionally drop non-owned gradient memory after the reduce-scatter, and in its
+mixed-precision setting the FP32 master weights are partitioned too, so ZeRO stage 1 saves somewhat
+more memory than our FP32-only simplification. Mechanically, our per-owner sequential broadcasts
+move the same bytes as ZeRO's single all-gather but pipeline worse.
+
+## Fully-Sharded Data Parallel (7, `fsdp` / `fsdp_accounting`)
+
+### Implementation
+
+`cs336_systems/fsdp.py` implements `FSDP(nn.Module)`. Every `Linear`/`Embedding` weight (norms stay
+replicated) is flattened, zero-padded to an even split, and sharded across ranks; the module's
+`weight` Parameter is replaced by the rank's FP32 master shard and its forward is routed through a
+custom autograd Function. Forward all-gathers the full weight (casting shards to `compute_dtype`
+*before* communication when mixed precision is requested), computes, and does not retain the full
+weight; backward all-gathers it again (the embedding backward needs no weight at all), computes the
+full weight gradient, and reduce-scatters it (`reduce_scatter_tensor` on NCCL, all-reduce + shard
+slice on gloo) so each rank keeps the summed gradient for its own shard. The all-gather for layer
+i+2 is prefetched asynchronously when layer i's forward completes (symmetrically in backward), so
+up to two layers' weights are in flight at once. `finish_gradient_synchronization()` divides shard
+gradients by world size and all-reduces the replicated (norm) gradients.
+`pytest tests/test_fsdp.py` passes 5/5 rounds (fp32 and fp16 compute, correctness and
+gradient-sync), and the DDP/sharded-optimizer tests still pass.
+
+### (a) Expected memory saving
+
+Sharding divides every piece of the per-rank static state by N: relative to the Section 6 full
+optimizer (large, 2 GPUs), parameters 3.72 → 1.86 GiB, gradients 3.66 → 1.83 GiB, and AdamW states
+7.39 → 3.70 GiB, so the pre-step memory of 14.77 GiB should drop to ≈7.4 GiB and the peak should
+fall by the same ≈7.4 GiB (19.44 → ≈12 GiB, ignoring all-gather buffers as instructed).
+Qualitatively, only activations and communication buffers remain replicated, and the saving
+fraction (N−1)/N grows with world size.
+
+### (b) Profiling xl under FSDP: does the all-gather finish in time?
+
+Script: `cs336_systems/fsdp_accounting.py` (xl, 1 node × 2 GPUs, global batch 2, ctx 512, FP32
+compute; SGD to stay within the free memory left by a co-tenant job — with AdamW the sharded static
+state alone would be ~20.5 GiB/rank). Measured per rank: 6.41 GiB after init (sharded master
+weights), 12.99 GiB before/after the optimizer step (plus sharded gradients), peak 13.98 GiB — xl
+trains comfortably under FSDP even though plain DDP cannot fit it at all (~25.4 GiB for FP32
+parameters+gradients alone). Data: `profiles/fsdp_accounting.csv`.
+
+The timing answer is a clear **no**: one step takes 10.6 s (forward 3.63 s, backward 6.92 s,
+optimizer 0.04 s). Per forward pass each rank must gather (N−1)/N × 13.65 GB ≈ 6.8 GB of weights,
+which at the ~3.5 GB/s interconnect of Section 5.1 is a ~2 s lower bound on communication — while a
+512-token layer forward is only a few ms of compute. The Nsight timeline below shows the NCCL lane
+saturated for the whole step while the compute lane is sparse: even with two-layer prefetch the GPU
+is almost always waiting for weights. FSDP's "communication is free if it keeps up with compute"
+premise fails on this PCIe-class interconnect; it needs NVLink/InfiniBand-class bandwidth (or much
+larger per-device batch) for the all-gather to finish in time.
+
+![fsdp xl trace](writeup_assets/fsdp_xl_trace.png)
+
+*GPU kernel timeline of one FSDP xl training step (rank 0), from
+`profiles/fsdp_xl_trace.nsys-rep` (figure: `profiles/make_fsdp_trace_figure.py`). The NCCL lane
+(weight all-gathers + gradient reduce-scatters) is busy nearly 100% of the step while compute
+kernels are sparse bursts.*
+
+## Analyzing Parallelism Strategies (8)
+
+Ring primitives with N devices and per-device egress bandwidth W: all-gather and reduce-scatter of
+a size-S tensor each take (N−1)/N · S/W; all-reduce (reduce-scatter + all-gather) takes
+2(N−1)/N · S/W.
+
+### `alternate_ring_all_reduce`
+
+The algorithm takes **(N−1)·S/W**: each of the N−1 steps transmits a *full* tensor of size S
+(partial sums are full-size, unlike the chunked rings above), so the total time is N−1 steps times
+S/W — a factor of ~N/2 worse than the standard ring all-reduce for large S.
+
+### `data_parallel_calcs`
+
+(a) Backward FLOPs per device: **12·B·D·D_FF / N_DP**. The backward has six matmuls (dz, two terms
+of dx, dW1, dW2, dW3), each costing 2·(B/N_DP)·D·D_FF on the local (B/N_DP)-row batch shard.
+
+(b) Backward communication: **12(N_DP−1)·D·D_FF / (N_DP·W)**. The three weight gradients total
+3 × 2·D·D_FF bytes (FP16), and the ring all-reduce costs 2(N−1)/N · S/W — independent of B, since
+only weight gradients are communicated.
+
+(c) Communication-bottlenecked when 12(N−1)D·D_FF/(NW) ≥ 12BD·D_FF/(NC) ⇔ N−1 ≥ BW/C, i.e.
+compute-bound while **N_DP < 1 + BW/C**. Notably independent of D and D_FF: both compute and
+communication scale with the weight count, so only the batch B and the compute/bandwidth ratio
+matter.
+
+### `fsdp_calcs`
+
+(a) Forward **6BD·D_FF/N_FSDP**, backward **12BD·D_FF/N_FSDP** per device — identical to DP,
+because weights are re-materialized to full size before use, so each device's matmuls only see its
+batch shard.
+
+(b) Forward communication: **6(N−1)D·D_FF/(NW)**, for the three weight all-gathers
+(3 × 2D·D_FF bytes at ring all-gather cost). Backward communication: **12(N−1)D·D_FF/(NW)** — the
+same three weight all-gathers *plus* three gradient reduce-scatters of the same total size.
+
+(c) Backward: 12(N−1)D·D_FF/(NW) ≥ 12BD·D_FF/(NC) ⇔ **N_FSDP ≥ 1 + BW/C**. Forward:
+6(N−1)D·D_FF/(NW) ≥ 6BD·D_FF/(NC) ⇔ **N_FSDP ≥ 1 + BW/C**. Both passes hit the same threshold as
+DP: FSDP moves the same gradient bytes (as reduce-scatter) and adds weight all-gathers, but its
+forward carries half the backward's total communication, matching its halved FLOP count.
+
+### `tp_calcs`
+
+(a) With W1, W2 column-parallel and W3 row-parallel, the forward stores per-device x, x1ⁱ, x2ⁱ,
+zⁱ, and y is replicated (it was all-reduced), so dy is replicated on every device. Backward on
+device i:
+
+```
+dzⁱ  = dy · W3ⁱᵀ
+dx2ⁱ = dzⁱ * f(x1ⁱ)
+dx1ⁱ = dzⁱ * f'(x1ⁱ) * x2ⁱ
+dW3ⁱ = zⁱᵀ · dy
+dW2ⁱ = xᵀ · dx2ⁱ
+dW1ⁱ = xᵀ · dx1ⁱ
+dxⁱ  = dx1ⁱ · W1ⁱᵀ + dx2ⁱ · W2ⁱᵀ
+dx   = all-reduce({dxⁱ})
+```
+
+The weight gradients stay sharded (each device updates its own shard; no gradient collective is
+needed), and the only communication is the final all-reduce that assembles dx from the partial
+products — mirroring the forward's all-reduce of y.
+
+(b) Forward **6BD·D_FF/N_TP**, backward **12BD·D_FF/N_TP** per device: every matmul has its D_FF
+dimension sharded across N_TP devices, while the full batch stays local.
+
+(c) Forward communication: **4(N−1)BD/(NW)** — one all-reduce of yⁱ (2BD bytes in FP16). Backward:
+**4(N−1)BD/(NW)** — one all-reduce of dx. TP communicates *activations*, not weights.
+
+(d) Backward: 4(N−1)BD/(NW) ≥ 12BD·D_FF/(NC) ⇔ **N_TP ≥ 1 + 3D_FF·W/C**. Forward:
+4(N−1)BD/(NW) ≥ 6BD·D_FF/(NC) ⇔ **N_TP ≥ 1 + (3/2)·D_FF·W/C**. The threshold is independent of B
+and D (both compute and communication scale with the activation size BD) and grows with D_FF — TP
+scales much further than DP/FSDP on the same link, which is why it is the intra-node strategy.
+
+### `fsdp_tp_calcs`
+
+(a) Forward FLOPs per device: **6BD·D_FF/(N_FSDP·N_TP)** — the batch is sharded across the FSDP
+axis and the D_FF dimension across the TP axis.
+
+(b) With the two axes' collectives overlapped, communication time is **max(T_FSDP, T_TP)**, where
+the FSDP axis all-gathers three TP-sharded weights,
+T_FSDP = 6D·D_FF·(N_FSDP−1)/(N_FSDP·N_TP·W), and the TP axis all-reduces the batch-sharded
+activation, T_TP = 4BD·(N_TP−1)/(N_FSDP·N_TP·W).
+
+(c) At the optimum the two collectives are balanced (for large N):
+6D·D_FF/N_TP ≈ 4BD/N_FSDP ⇔ N_TP/N_FSDP = 3D_FF/(2B), i.e. N_TP = √(3D_FF·N/(2B)),
+N_FSDP = √(2BN/(3D_FF)). Communication-bottlenecked when the balanced communication exceeds
+compute: 6D·D_FF/(N_TP·W) ≥ 6BD·D_FF/(NC) ⇔ N ≤ (BW/C)·N_TP, and substituting N_TP gives
+
+**N ≤ (3/2)·B·D_FF·(W/C)²**
+
+The 2D limit is the product of the two 1D limits (N_FSDP ≈ BW/C, N_TP ≈ (3/2)·D_FF·W/C):
+quadratic in the bandwidth/compute ratio, so combining the axes scales to far more devices than
+either alone.
+
+(d) If the axes share the link, costs add: T = T_FSDP + T_TP. The sum is minimized at the same
+balance point, where both terms are equal, so T = 12D·D_FF/(N_TP·W), and the bottleneck condition
+12D·D_FF/(N_TP·W) ≥ 6BD·D_FF/(NC) with the same optimal split gives
+
+**N ≤ (3/8)·B·D_FF·(W/C)²**
+
+— a factor of 4 smaller than with overlapped collectives (the sum is twice either balanced term,
+and N scales with the square of the per-axis budget).
+
+## Leaderboard (9, `leaderboard`)
+
+The leaderboard times a full training step (forward, loss, backward, AdamW) for an 8B model
+(vocab 151936, ctx 32768, d_model 4096, d_ff 11008, 34 layers), BF16, causal, batch 2, on *two
+B200 GPUs*.
+
+We attempted it on our hardware and report why it is out of reach rather than a time. The model has
+8.13B parameters: BF16 weights + BF16 gradients + FP32 AdamW moments total 15.2 + 15.2 + 60.8 ≈ 91
+GiB of static state, against 2 × 23.6 GiB on our RTX 3090s — infeasible even with perfect sharding,
+before counting activations. A probe confirms the wall from the other side: the model initializes
+in BF16 on one card (15.1 GiB), but a naïve forward at ctx 32768 immediately OOMs because the
+attention scores alone are 2 × 32 × 32768² BF16 = 128 GiB — never mind the 2 × 32768 × 151936
+logits (~19 GiB in BF16) that the handout's fused-LM-head suggestion exists to avoid. A serious
+entry would need the Triton FlashAttention backward, a fused LM-head+loss kernel, activation
+checkpointing, sharded optimizer states, and TMA-class features our sm_86 cards lack — and the
+resulting time would still not be comparable to the 2×B200 leaderboard (nor beat its 10 s baseline
+from two shared 24 GiB cards). The required optimizations are exactly the ones built and measured
+in Sections 4–7; we leave the leaderboard as out of scope for this hardware.
